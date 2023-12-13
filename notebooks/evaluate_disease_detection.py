@@ -145,7 +145,7 @@ if __name__ == "__main__":
 
     # PATH TO PREDICTION AND DATA CHARACTERISTICS FILE
     cnn_pred = pd.read_csv(
-        "../prediction/chexpert-model/predictions.test.csv"
+        "../prediction/cxr-foundation-linear/predictions.test.csv"
     )
     data_characteristics = pd.read_csv("../datafiles/chexpert/chexpert.resample.test.csv")
 

@@ -12,18 +12,21 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from tqdm import tqdm
 from argparse import ArgumentParser
 
+
 num_classes = 14
+num_races = 3
 batch_size = 150
 epochs = 20
-num_workers = 36
+num_workers = 1
 
-img_data_dir = '/data4/CheXpert/'
-data_dir = '/data4/CheXpert/chexpert_embeddings'
+dict1_path = '/data4/CheXpert/train.npz'
+dict2_path = '/data4/CheXpert/validation.npz'
 
 
 class CheXpertDataset(Dataset):
-    def __init__(self, csv_file):
+    def __init__(self, csv_file, num_races=num_races):
         self.data = pd.read_csv(csv_file)
+        self.num_races = num_races
 
         self.labels = [
             'No Finding',
@@ -42,45 +45,59 @@ class CheXpertDataset(Dataset):
             'Support Devices']
 
         self.samples = []
-        self.features = []
         for idx, _ in enumerate(tqdm(range(len(self.data)), desc='Loading Data')):
             img_path = self.data.loc[idx, 'path_preproc']
+            img_race = self.data.loc[idx, 'race']
             img_label = np.zeros(len(self.labels), dtype='float32')
             for i in range(0, len(self.labels)):
                 img_label[i] = np.array(self.data.loc[idx, self.labels[i].strip()] == 1, dtype='float32')
 
-            sample = {'image_path': img_path, 'label': img_label}
+            sample = {'image_path': img_path, 'label': img_label, 'race': img_race}
             self.samples.append(sample)
-
-            img_fn = os.path.basename(sample['image_path'])
-            feat_fn = os.path.join(data_dir, img_fn.replace('.jpg', '.dat'))
-
-            feature = np.fromfile(feat_fn).astype(np.float32)
-            self.features.append(feature)
+        self.dict1 = np.load(dict1_path, allow_pickle=True)
+        self.dict2 = np.load(dict2_path, allow_pickle=True)
 
     def __len__(self):
         return len(self.data)
 
+    def get_race_index(self, race):
+        race_index = 0
+        if race == "White":
+            race_index = 0
+        elif race == "Black":
+            race_index = 1
+        elif race == "Asian":
+            race_index = 2
+        return race_index
+
     def __getitem__(self, item):
-        sample = self.samples[item]
+        sample = self.get_sample(item)
 
-        features = torch.from_numpy(self.features[item])
+        features = torch.from_numpy(sample['features'])
         label = torch.from_numpy(sample['label'])
+        race_index = self.get_race_index(sample['race'])
+        race = torch.tensor([race_index])
 
-        return {'features': features, 'label': label}
+        return {'features': features, 'label': label, 'race': race}
 
     def get_sample(self, item):
         sample = self.samples[item]
         img_fn = os.path.basename(sample['image_path'])
-        feat_fn = os.path.join(data_dir, img_fn.replace('.jpg', '.dat'))
-
-        features = np.fromfile(feat_fn).astype(np.float32)
-
-        return {'features': features, 'label': sample['label']}
+        parts = img_fn.split('_')
+        patient_str, study_str, view_str, view_type = parts[0][7:], parts[1][5:], parts[2][4:], parts[3][:-4]
+        formatted_filename = f"patient{int(patient_str):05d}/study{int(study_str)}/view{view_str}_{view_type}.jpg"
+        key1 = "CheXpert-v1.0/train/" + formatted_filename
+        key2 = "CheXpert-v1.0/valid/" + formatted_filename
+        if key1 in self.dict1:
+            features = self.dict1[key1]
+        elif key2 in self.dict2:
+            features = self.dict2[key2]
+        features = features.astype(np.float32)
+        return {'features': features, 'label': sample['label'], 'race': sample['race']}
 
 
 class CheXpertDataModule(pl.LightningDataModule):
-    def __init__(self, csv_train, csv_val, csv_test, batch_size, num_workers):
+    def __init__(self, csv_train, csv_val, csv_test, batch_size, num_workers, num_races):
         super().__init__()
         self.csv_train = csv_train
         self.csv_val = csv_val
@@ -88,9 +105,9 @@ class CheXpertDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-        self.train_set = CheXpertDataset(self.csv_train)
-        self.val_set = CheXpertDataset(self.csv_val)
-        self.test_set = CheXpertDataset(self.csv_test)
+        self.train_set = CheXpertDataset(self.csv_train, num_races=num_races)
+        self.val_set = CheXpertDataset(self.csv_val, num_races=num_races)
+        self.test_set = CheXpertDataset(self.csv_test, num_races=num_races)
 
         print('#train: ', len(self.train_set))
         print('#val:   ', len(self.val_set))
@@ -107,9 +124,10 @@ class CheXpertDataModule(pl.LightningDataModule):
 
 
 class MLP(pl.LightningModule):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes, num_races):
         super().__init__()
         self.num_classes = num_classes
+        self.num_races = num_races
         
         # CXR-MLP-5
         # self.model = nn.Sequential(
@@ -120,8 +138,7 @@ class MLP(pl.LightningModule):
         #     nn.Linear(512, 128),
         #     nn.ReLU(inplace=True),
         #     nn.Linear(128, 128),
-        #     nn.ReLU(inplace=True),
-        #     nn.Linear(128, num_classes)
+        #     nn.ReLU(inplace=True)
         # )
 
         # CXR-MLP-3
@@ -129,17 +146,32 @@ class MLP(pl.LightningModule):
         #     nn.Linear(1376, 512),
         #     nn.ReLU(inplace=True),
         #     nn.Linear(512, 512),
-        #     nn.ReLU(inplace=True),
-        #     nn.Linear(512, num_classes)
+        #     nn.ReLU(inplace=True)
         # )
 
         # CXR-Linear
-        self.model = nn.Sequential(
-            nn.Linear(1376, num_classes)
-        )
+        self.model = nn.Identity()
 
-    def forward(self, x):
-        return self.model(x)
+        # if the model is CXR-MLP-5 or CXR-MLP-3, num_features is different
+        if isinstance(self.model, nn.Identity):
+            num_features = 1376
+        else:
+            num_features = self.model[-1].out_features
+
+        self.classifiers = nn.ModuleDict({
+            str(i): nn.Linear(num_features, self.num_classes) for i in range(num_races)
+        })
+
+
+
+    def forward(self, x, race):
+        x = self.model.forward(x)
+        outputs = []
+        for i, r in enumerate(race):
+            output = self.classifiers[str(r.item())](x[i])
+            outputs.append(output)
+        x = torch.stack(outputs)
+        return x
 
     def configure_optimizers(self):
         params_to_update = []
@@ -150,11 +182,11 @@ class MLP(pl.LightningModule):
         return optimizer
 
     def unpack_batch(self, batch):
-        return batch['features'], batch['label']
+        return batch['features'], batch['label'], batch['race']
 
     def process_batch(self, batch):
-        feat, lab = self.unpack_batch(batch)
-        out = self.forward(feat)
+        feat, lab, race = self.unpack_batch(batch)
+        out = self.forward(feat, race)
         prob = torch.sigmoid(out)
         loss = F.binary_cross_entropy(prob, lab)
         return loss
@@ -181,8 +213,8 @@ def test(model, data_loader, device):
 
     with torch.no_grad():
         for index, batch in enumerate(tqdm(data_loader, desc='Test-loop')):
-            feat, lab = batch['features'].to(device), batch['label'].to(device)
-            out = model(feat)
+            feat, lab, race = batch['features'].to(device), batch['label'].to(device), batch['race'].to(device)
+            out = model(feat, race)
             pred = torch.sigmoid(out)
             logits.append(out)
             preds.append(pred)
@@ -212,14 +244,15 @@ def main(hparams):
                               csv_val='../datafiles/chexpert/chexpert.sample.val.csv',
                               csv_test='../datafiles/chexpert/chexpert.resample.test.csv',
                               batch_size=batch_size,
-                              num_workers=num_workers)
+                              num_workers=num_workers,
+                              num_races=num_races)
 
     # model
     model_type = MLP
-    model = model_type(num_classes=num_classes)
+    model = model_type(num_classes=num_classes, num_races=num_races)
 
     # Create output directory
-    out_name = 'cxr-foundation-linear'
+    out_name = 'cxr-foundation-multitask'
     out_dir = './' + out_name
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
@@ -231,14 +264,13 @@ def main(hparams):
         callbacks=[checkpoint_callback],
         log_every_n_steps = 5,
         max_epochs=epochs,
-        accelerator='auto',
-        devices='auto',
         logger=TensorBoardLogger('.', name=out_name),
+        num_sanity_val_steps=0
     )
     trainer.logger._default_hp_metric = False
     trainer.fit(model, data)
 
-    model = model_type.load_from_checkpoint(trainer.checkpoint_callback.best_model_path, num_classes=num_classes)
+    model = model_type.load_from_checkpoint(trainer.checkpoint_callback.best_model_path, num_classes=num_classes, num_races=num_races)
 
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda:" + str(hparams.dev) if use_cuda else "cpu")
@@ -268,7 +300,7 @@ def main(hparams):
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('--gpus', default="auto")
+    parser.add_argument('--gpus', default=1)
     parser.add_argument('--dev', default=0)
     args = parser.parse_args()
 

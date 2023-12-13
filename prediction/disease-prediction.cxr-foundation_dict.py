@@ -12,13 +12,14 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from tqdm import tqdm
 from argparse import ArgumentParser
 
+
 num_classes = 14
 batch_size = 150
 epochs = 20
-num_workers = 36
+num_workers = 2
 
-img_data_dir = '/data4/CheXpert/'
-data_dir = '/data4/CheXpert/chexpert_embeddings'
+dict1_path = '/data4/CheXpert/train.npz'
+dict2_path = '/data4/CheXpert/validation.npz'
 
 
 class CheXpertDataset(Dataset):
@@ -42,29 +43,28 @@ class CheXpertDataset(Dataset):
             'Support Devices']
 
         self.samples = []
-        self.features = []
+        dict1 = np.load(dict1_path, allow_pickle=True)
+        dict2 = np.load(dict2_path, allow_pickle=True)
         for idx, _ in enumerate(tqdm(range(len(self.data)), desc='Loading Data')):
             img_path = self.data.loc[idx, 'path_preproc']
-            img_label = np.zeros(len(self.labels), dtype='float32')
-            for i in range(0, len(self.labels)):
-                img_label[i] = np.array(self.data.loc[idx, self.labels[i].strip()] == 1, dtype='float32')
-
-            sample = {'image_path': img_path, 'label': img_label}
+            img_label = np.array([self.data.loc[idx, label.strip()] == 1 for label in self.labels], dtype='float32')
+            img_fn = os.path.basename(img_path)
+            parts = img_fn.split('_')
+            patient_str, study_str, view_str, view_type = parts[0][7:], parts[1][5:], parts[2][4:], parts[3][:-4]
+            formatted_filename = f"patient{int(patient_str):05d}/study{int(study_str)}/view{view_str}_{view_type}.jpg"
+            key1 = "CheXpert-v1.0/train/" + formatted_filename
+            key2 = "CheXpert-v1.0/valid/" + formatted_filename
+            features = dict1.get(key1, dict2.get(key2)).astype(np.float32)
+            sample = {'image_path': img_path, 'label': img_label, 'features': features}
             self.samples.append(sample)
-
-            img_fn = os.path.basename(sample['image_path'])
-            feat_fn = os.path.join(data_dir, img_fn.replace('.jpg', '.dat'))
-
-            feature = np.fromfile(feat_fn).astype(np.float32)
-            self.features.append(feature)
-
+            
+        
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, item):
         sample = self.samples[item]
-
-        features = torch.from_numpy(self.features[item])
+        features = torch.from_numpy(sample['features'])
         label = torch.from_numpy(sample['label'])
 
         return {'features': features, 'label': label}
@@ -72,10 +72,17 @@ class CheXpertDataset(Dataset):
     def get_sample(self, item):
         sample = self.samples[item]
         img_fn = os.path.basename(sample['image_path'])
-        feat_fn = os.path.join(data_dir, img_fn.replace('.jpg', '.dat'))
-
-        features = np.fromfile(feat_fn).astype(np.float32)
-
+        parts = img_fn.split('_')
+        patient_str, study_str, view_str, view_type = parts[0][7:], parts[1][5:], parts[2][4:], parts[3][:-4]
+        formatted_filename = f"patient{int(patient_str):05d}/study{int(study_str)}/view{view_str}_{view_type}.jpg"
+        key1 = "CheXpert-v1.0/train/" + formatted_filename
+        key2 = "CheXpert-v1.0/valid/" + formatted_filename
+        if key1 in self.dict1:
+            features = self.dict1[key1]
+        elif key2 in self.dict2:
+            features = self.dict2[key2]
+        print(features.shape, type(features))
+        features = features.astype(np.float32)
         return {'features': features, 'label': sample['label']}
 
 
@@ -231,9 +238,8 @@ def main(hparams):
         callbacks=[checkpoint_callback],
         log_every_n_steps = 5,
         max_epochs=epochs,
-        accelerator='auto',
-        devices='auto',
         logger=TensorBoardLogger('.', name=out_name),
+        num_sanity_val_steps=0
     )
     trainer.logger._default_hp_metric = False
     trainer.fit(model, data)
@@ -268,7 +274,7 @@ def main(hparams):
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('--gpus', default="auto")
+    parser.add_argument('--gpus', default=1)
     parser.add_argument('--dev', default=0)
     args = parser.parse_args()
 

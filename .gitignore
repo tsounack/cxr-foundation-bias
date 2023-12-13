@@ -1,0 +1,10 @@
+datafiles/chexpert/*
+!datafiles/chexpert/'CHEXPERT DEMO.csv'
+
+prediction/chexpert-model/
+prediction/cxr-*
+prediction/densenet*
+prediction/foundation*
+prediction/lightning_logs/
+prediction/__pycache__/
+samples/*

@@ -19,6 +19,7 @@ from argparse import ArgumentParser
 
 image_size = (224, 224)
 num_classes = 14
+num_races = 3
 batch_size = 150
 epochs = 20
 num_workers = 4
@@ -26,11 +27,12 @@ img_data_dir = '/data4/CheXpert/'
 
 
 class CheXpertDataset(Dataset):
-    def __init__(self, csv_file_img, image_size, augmentation=False, pseudo_rgb = True):
+    def __init__(self, csv_file_img, image_size, augmentation=False, pseudo_rgb = True, num_races=num_races):
         self.data = pd.read_csv(csv_file_img)
         self.image_size = image_size
         self.do_augment = augmentation
         self.pseudo_rgb = pseudo_rgb
+        self.num_races = num_races
 
         self.labels = [
             'No Finding',
@@ -56,22 +58,34 @@ class CheXpertDataset(Dataset):
         self.samples = []
         for idx, _ in enumerate(tqdm(range(len(self.data)), desc='Loading Data')):
             img_path = img_data_dir + self.data.loc[idx, 'path_preproc']
+            img_race = self.data.loc[idx, 'race']
             img_label = np.zeros(len(self.labels), dtype='float32')
             for i in range(0, len(self.labels)):
                 img_label[i] = np.array(self.data.loc[idx, self.labels[i].strip()] == 1, dtype='float32')
 
-            sample = {'image_path': img_path, 'label': img_label}
+            sample = {'image_path': img_path, 'label': img_label, 'race': img_race}
             self.samples.append(sample)
 
     def __len__(self):
         return len(self.data)
-
+    
+    def get_race_index(self, race):
+        race_index = 0
+        if race == "White":
+            race_index = 0
+        elif race == "Black":
+            race_index = 1
+        elif race == "Asian":
+            race_index = 2
+        return race_index
     
     def __getitem__(self, item):
         sample = self.get_sample(item)
 
         image = torch.from_numpy(sample['image']).unsqueeze(0)
         label = torch.from_numpy(sample['label'])
+        race_index = self.get_race_index(sample['race'])
+        race = torch.tensor([race_index])
 
         if self.do_augment:
             image = self.augment(image)
@@ -82,17 +96,17 @@ class CheXpertDataset(Dataset):
             except Exception as e:
                 image = image.permute(0, 3, 1, 2).squeeze(0)
 
-        return {'image': image, 'label': label}
+        return {'image': image, 'label': label, 'race': race}
 
     def get_sample(self, item):
         sample = self.samples[item]
         image = imread(sample['image_path']).astype(np.float32)
 
-        return {'image': image, 'label': sample['label']}
+        return {'image': image, 'label': sample['label'], 'race': sample['race']}
 
 
 class CheXpertDataModule(pl.LightningDataModule):
-    def __init__(self, csv_train_img, csv_val_img, csv_test_img, image_size, pseudo_rgb, batch_size, num_workers):
+    def __init__(self, csv_train_img, csv_val_img, csv_test_img, image_size, pseudo_rgb, batch_size, num_workers, num_races):
         super().__init__()
         self.csv_train_img = csv_train_img
         self.csv_val_img = csv_val_img
@@ -101,9 +115,9 @@ class CheXpertDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-        self.train_set = CheXpertDataset(self.csv_train_img, self.image_size, augmentation=True, pseudo_rgb=pseudo_rgb)
-        self.val_set = CheXpertDataset(self.csv_val_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb)
-        self.test_set = CheXpertDataset(self.csv_test_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb)
+        self.train_set = CheXpertDataset(self.csv_train_img, self.image_size, augmentation=True, pseudo_rgb=pseudo_rgb, num_races=num_races)
+        self.val_set = CheXpertDataset(self.csv_val_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb, num_races=num_races)
+        self.test_set = CheXpertDataset(self.csv_test_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb, num_races=num_races)
 
         print('#train: ', len(self.train_set))
         print('#val:   ', len(self.val_set))
@@ -120,21 +134,32 @@ class CheXpertDataModule(pl.LightningDataModule):
 
 
 class DenseNet(pl.LightningModule):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes, num_races):
         super().__init__()
         self.num_classes = num_classes
+        self.num_races = num_races
         self.model = models.densenet121(pretrained=True)
         # freeze_model(self.model)
         num_features = self.model.classifier.in_features
-        self.model.classifier = nn.Linear(num_features, self.num_classes)
+        self.model.classifier = nn.Identity()
+        self.classifiers = nn.ModuleDict({
+            str(i): nn.Linear(num_features, self.num_classes) for i in range(num_races)
+        })
 
     def remove_head(self):
-        num_features = self.model.classifier.in_features
-        id_layer = nn.Identity(num_features)
-        self.model.classifier = id_layer
+        self.classifiers = nn.ModuleDict({
+            str(i): nn.Identity() for i in range(len(self.classifiers))
+        })
 
-    def forward(self, x):
-        return self.model.forward(x)
+    def forward(self, x, race):
+        x = self.model.forward(x)
+        outputs = []
+        for i, r in enumerate(race):
+            output = self.classifiers[str(r.item())](x[i])
+            outputs.append(output)
+        x = torch.stack(outputs)
+        return x
+
 
     def configure_optimizers(self):
         params_to_update = []
@@ -145,11 +170,11 @@ class DenseNet(pl.LightningModule):
         return optimizer
 
     def unpack_batch(self, batch):
-        return batch['image'], batch['label']
+        return batch['image'], batch['label'], batch['race']
 
     def process_batch(self, batch):
-        img, lab = self.unpack_batch(batch)
-        out = self.forward(img)
+        img, lab, race = self.unpack_batch(batch)
+        out = self.forward(img, race)
         prob = torch.sigmoid(out)
         loss = F.binary_cross_entropy(prob, lab)
         return loss
@@ -183,8 +208,8 @@ def test(model, data_loader, device):
 
     with torch.no_grad():
         for index, batch in enumerate(tqdm(data_loader, desc='Test-loop')):
-            img, lab = batch['image'].to(device), batch['label'].to(device)
-            out = model(img)
+            img, lab, race = batch['image'].to(device), batch['label'].to(device), batch['race'].to(device)
+            out = model(img, race)
             pred = torch.sigmoid(out)
             logits.append(out)
             preds.append(pred)
@@ -212,8 +237,8 @@ def embeddings(model, data_loader, device):
 
     with torch.no_grad():
         for index, batch in enumerate(tqdm(data_loader, desc='Test-loop')):
-            img, lab = batch['image'].to(device), batch['label'].to(device)
-            emb = model(img)
+            img, lab, race = batch['image'].to(device), batch['label'].to(device), batch['race'].to(device)
+            emb = model(img, race)
             embeds.append(emb)
             targets.append(lab)
 
@@ -235,14 +260,15 @@ def main(hparams):
                               image_size=image_size,
                               pseudo_rgb=True,
                               batch_size=batch_size,
-                              num_workers=num_workers)
+                              num_workers=num_workers,
+                              num_races=num_races)
 
     # model
     model_type = DenseNet
-    model = model_type(num_classes=num_classes)
+    model = model_type(num_classes=num_classes, num_races=num_races)
 
     # Create output directory
-    out_name = 'chexpert-model'
+    out_name = 'chexpert-multitask'
     out_dir = './' + out_name
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
@@ -268,7 +294,7 @@ def main(hparams):
     trainer.logger._default_hp_metric = False
     trainer.fit(model, data)
 
-    model = model_type.load_from_checkpoint(trainer.checkpoint_callback.best_model_path, num_classes=num_classes)
+    model = model_type.load_from_checkpoint(trainer.checkpoint_callback.best_model_path, num_classes=num_classes, num_races=num_races)
 
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda:" + str(hparams.dev) if use_cuda else "cpu")
